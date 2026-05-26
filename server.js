@@ -236,7 +236,7 @@ function srtToAss(srtRaw) {
     const text = lines.slice(textIdx).join(' ').trim();
     if (!text) continue;
     const allWords = text.split(/\s+/);
-    const chunks = chunk(allWords, 4);
+    const chunks = chunk(allWords, 3); // 3 words per visible line to keep text inside frame
     const totalDur = endSec - startSec;
     const totalWords = allWords.length;
     let cursor = startSec;
@@ -247,7 +247,8 @@ function srtToAss(srtRaw) {
       cursor = ce;
       const perWordCs = Math.max(5, Math.round((dur / c.length) * 100));
       const karaoke = c.map(w => `{\\kf${perWordCs}}${escapeAssText(w)}`).join(' ');
-      events.push(`Dialogue: 0,${toAssTime(cs)},${toAssTime(ce)},Default,,0,0,0,,{\\pos(540,1200)}${karaoke}`);
+      // No \pos — let Alignment + MarginV/L/R handle position. Style anchors to bottom-center at MarginV from bottom.
+      events.push(`Dialogue: 0,${toAssTime(cs)},${toAssTime(ce)},Default,,0,0,0,,${karaoke}`);
     }
   }
   return assHeader() + events.join('\n') + '\n';
@@ -266,6 +267,10 @@ function escapeAssText(t) {
   return String(t).replace(/\\/g, '\\\\').replace(/\n/g, '\\N').replace(/\{/g, '\\{').replace(/\}/g, '\\}');
 }
 function assHeader() {
+  // Style anchors text to BOTTOM-CENTER (Alignment=2). Text grows upward from MarginV.
+  // PlayResY=1920, MarginV=720 → baseline ~y=1200. Left/Right margins 90 keep text inside frame.
+  // WrapStyle=0 = smart wrap (top line wider) so long phrases wrap to 2 lines instead of overflowing.
+  // Font 84pt (was 100) gives more breathing room horizontally.
   return [
     '[Script Info]',
     'Title: QEEP karaoke subs',
@@ -273,11 +278,11 @@ function assHeader() {
     'PlayResX: 1080',
     'PlayResY: 1920',
     'ScaledBorderAndShadow: yes',
-    'WrapStyle: 2',
+    'WrapStyle: 0',
     '',
     '[V4+ Styles]',
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-    'Style: Default,Inter,100,&H0000FFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,12,8,5,40,40,40,1',
+    'Style: Default,Inter,84,&H0000FFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,10,6,2,90,90,720,1',
     '',
     '[Events]',
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
