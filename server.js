@@ -1,12 +1,11 @@
-// QEEP Subtitler Service v1.1
-// - Burns karaoke-style subtitles into video via ffmpeg.
-// - If no SRT supplied, transcribes Russian speech with Whisper (transformers.js) automatically.
+// QEEP Subtitler Service v1.2
+// Cloud-Whisper edition: uses Groq Whisper API (free tier) for transcription.
+// Burns karaoke subs via ffmpeg, returns mp4 URL.
+//
 // POST /render { video_url, srt_url? OR srt_content? }
-//   → returns { jobId } immediately
 // GET  /status/:jobId
-//   → { status: 'pending' | 'done' | 'error', url?, error? }
-// GET  /files/:filename → serves rendered mp4
-// GET  /health → wakeup endpoint
+// GET  /files/:filename
+// GET  /health
 
 const express = require('express');
 const { spawn } = require('child_process');
@@ -25,23 +24,29 @@ const TMP = process.env.TMP_DIR || '/tmp/subtitler';
 fs.mkdirSync(TMP, { recursive: true });
 
 const PUBLIC_BASE = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
-const WHISPER_MODEL = process.env.WHISPER_MODEL || 'Xenova/whisper-tiny';
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'whisper-large-v3-turbo';
 
-// Lazy Whisper init (transformers.js downloads model on first call ~75 MB to /tmp).
-let _transcriber = null;
-async function getTranscriber() {
-  if (_transcriber) return _transcriber;
-  const { pipeline, env } = await import('@xenova/transformers');
-  env.cacheDir = path.join(TMP, 'models');
-  env.allowLocalModels = false;
-  _transcriber = await pipeline('automatic-speech-recognition', WHISPER_MODEL);
-  return _transcriber;
+// Persistent jobs file — survives cold restarts.
+const JOBS_FILE = path.join(TMP, 'jobs.json');
+let jobs = loadJobsSync();
+
+function loadJobsSync() {
+  try { return new Map(JSON.parse(fs.readFileSync(JOBS_FILE, 'utf8'))); } catch (e) { return new Map(); }
 }
-
-const jobs = new Map();
+async function saveJobs() {
+  try { await fsp.writeFile(JOBS_FILE, JSON.stringify([...jobs.entries()])); } catch (e) {}
+}
+function setJob(id, data) { jobs.set(id, { ...data, updatedAt: Date.now() }); saveJobs(); }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, ffmpeg: !!ffmpegPath, whisperReady: !!_transcriber, time: new Date().toISOString() });
+  res.json({
+    ok: true,
+    ffmpeg: !!ffmpegPath,
+    groq: !!GROQ_API_KEY,
+    jobs: jobs.size,
+    time: new Date().toISOString()
+  });
 });
 
 app.use('/files', express.static(TMP, { maxAge: '1h' }));
@@ -50,24 +55,24 @@ app.post('/render', async (req, res) => {
   const { video_url, srt_url, srt_content } = req.body || {};
   if (!video_url) return res.status(400).json({ error: 'video_url required' });
   const jobId = randomUUID();
-  jobs.set(jobId, { status: 'pending', startedAt: Date.now() });
+  setJob(jobId, { status: 'pending', startedAt: Date.now() });
   renderJob(jobId, { video_url, srt_url, srt_content }).catch(e => {
     console.error('[' + jobId + '] FAILED:', e);
-    jobs.set(jobId, { status: 'error', error: String(e.message || e) });
+    setJob(jobId, { status: 'error', error: String(e.message || e) });
   });
   res.json({ jobId, status: 'pending' });
 });
 
 app.get('/status/:jobId', (req, res) => {
   const j = jobs.get(req.params.jobId);
-  if (!j) return res.status(404).json({ error: 'job not found (cold-restart cleared memory?)' });
+  if (!j) return res.status(404).json({ error: 'job not found' });
   res.json(j);
 });
 
 async function renderJob(jobId, { video_url, srt_url, srt_content }) {
   const log = (m) => console.log('[' + jobId + ']', m);
   const videoPath = path.join(TMP, `${jobId}-in.mp4`);
-  const wavPath = path.join(TMP, `${jobId}.wav`);
+  const audioPath = path.join(TMP, `${jobId}.mp3`);
   const assPath = path.join(TMP, `${jobId}.ass`);
   const outName = `${jobId}-out.mp4`;
   const outPath = path.join(TMP, outName);
@@ -75,31 +80,19 @@ async function renderJob(jobId, { video_url, srt_url, srt_content }) {
   log('downloading video');
   await downloadToFile(video_url, videoPath);
 
-  // SOURCE OF SUBTITLES:
-  // 1) inline srt_content, 2) srt_url, 3) Whisper transcription from audio
   let srt = srt_content;
   if (!srt && srt_url) {
     log('fetching srt from url');
     srt = await fetchText(srt_url);
   }
   if (!srt) {
-    log('no SRT supplied — extracting audio for Whisper');
-    await runFfmpeg(['-y', '-i', videoPath, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wavPath]);
-    log('loading Whisper model (' + WHISPER_MODEL + ')');
-    const transcriber = await getTranscriber();
-    log('running Whisper transcription');
-    const audioData = await loadWavAsFloat32(wavPath);
-    const result = await transcriber(audioData, {
-      language: 'russian',
-      task: 'transcribe',
-      chunk_length_s: 30,
-      stride_length_s: 5,
-      return_timestamps: true
-    });
-    srt = chunksToSrt(result.chunks || []);
-    log('whisper produced ' + (result.chunks?.length || 0) + ' chunks');
+    if (!GROQ_API_KEY) throw new Error('No SRT supplied and GROQ_API_KEY not set');
+    log('extracting audio for Groq Whisper');
+    await runFfmpeg(['-y', '-i', videoPath, '-vn', '-acodec', 'libmp3lame', '-q:a', '4', '-ar', '16000', '-ac', '1', audioPath]);
+    log('calling Groq Whisper');
+    srt = await groqTranscribeToSrt(audioPath);
+    log('groq returned ' + srt.split('\n\n').filter(Boolean).length + ' segments');
   }
-
   if (!srt || srt.trim().length === 0) throw new Error('no subtitles could be produced');
 
   const ass = srtToAss(srt);
@@ -113,55 +106,68 @@ async function renderJob(jobId, { video_url, srt_url, srt_content }) {
     outPath
   ]);
 
-  // Cleanup intermediates.
   fsp.unlink(videoPath).catch(() => {});
-  fsp.unlink(wavPath).catch(() => {});
+  fsp.unlink(audioPath).catch(() => {});
   fsp.unlink(assPath).catch(() => {});
   setTimeout(() => fsp.unlink(outPath).catch(() => {}), 60 * 60 * 1000);
 
-  jobs.set(jobId, { status: 'done', url: `${PUBLIC_BASE}/files/${outName}` });
+  setJob(jobId, { status: 'done', url: `${PUBLIC_BASE}/files/${outName}` });
   log('done -> ' + outName);
 }
 
-async function loadWavAsFloat32(wavPath) {
-  const { WaveFile } = require('wavefile');
-  const buf = await fsp.readFile(wavPath);
-  const wav = new WaveFile(buf);
-  wav.toBitDepth('32f');
-  wav.toSampleRate(16000);
-  let samples = wav.getSamples();
-  if (Array.isArray(samples)) samples = samples[0]; // stereo → take left
-  return samples;
-}
+// ── Groq Whisper (free tier) ───────────────────
+async function groqTranscribeToSrt(audioPath) {
+  const audioBuf = await fsp.readFile(audioPath);
+  const boundary = '----QEEP' + randomUUID();
+  const parts = [];
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${GROQ_MODEL}\r\n`));
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\nverbose_json\r\n`));
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nru\r\n`));
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n`));
+  parts.push(audioBuf);
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+  const body = Buffer.concat(parts);
 
-function chunksToSrt(chunks) {
-  // chunks: [{ text, timestamp: [start, end] }, ...]
+  const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${GROQ_API_KEY}`,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`
+    },
+    body
+  });
+  const text = await resp.text();
+  if (!resp.ok) throw new Error('Groq API ' + resp.status + ': ' + text.slice(0, 500));
+  const data = JSON.parse(text);
+
+  // verbose_json returns { segments: [{ start, end, text, ... }] }
+  const segs = Array.isArray(data.segments) ? data.segments : [];
+  if (segs.length === 0 && data.text) {
+    // fallback: synthesize one segment if no segmentation
+    return `1\n00:00:00,000 --> 00:00:30,000\n${data.text.trim()}\n\n`;
+  }
   let srt = '';
   let idx = 1;
-  for (const c of chunks) {
-    const t = (c.timestamp || []);
-    const start = Number(t[0] || 0);
-    const end = Number(t[1] || start + 1);
-    if (end <= start) continue;
-    const text = String(c.text || '').trim();
-    if (!text) continue;
-    srt += `${idx}\n${srtTime(start)} --> ${srtTime(end)}\n${text}\n\n`;
+  for (const s of segs) {
+    const t = String(s.text || '').trim();
+    if (!t) continue;
+    srt += `${idx}\n${srtTime(s.start)} --> ${srtTime(s.end)}\n${t}\n\n`;
     idx++;
   }
   return srt;
 }
 
 function srtTime(sec) {
-  const total = Math.max(0, sec);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = Math.floor(total % 60);
-  const ms = Math.floor((total - Math.floor(total)) * 1000);
+  const t = Math.max(0, Number(sec) || 0);
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60);
+  const s = Math.floor(t % 60);
+  const ms = Math.floor((t - Math.floor(t)) * 1000);
   return `${pad(h, 2)}:${pad(m, 2)}:${pad(s, 2)},${pad(ms, 3)}`;
 }
 function pad(n, w) { return String(n).padStart(w, '0'); }
 
-// ── ffmpeg helper ──────────────────────────────
+// ── ffmpeg ─────────────────────────────────────
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath, args);
@@ -174,9 +180,7 @@ function runFfmpeg(args) {
     });
   });
 }
-function escapeForFilter(p) {
-  return p.replace(/\\/g, '/').replace(/:/g, '\\:');
-}
+function escapeForFilter(p) { return p.replace(/\\/g, '/').replace(/:/g, '\\:'); }
 
 // ── network ─────────────────────────────────────
 function downloadToFile(url, dest) {
@@ -219,7 +223,6 @@ function fetchText(url) {
 function srtToAss(srtRaw) {
   const blocks = String(srtRaw).replace(/\r/g, '').trim().split(/\n{2,}/);
   const events = [];
-
   for (const block of blocks) {
     const lines = block.split('\n').filter(Boolean);
     if (lines.length < 2) continue;
@@ -232,10 +235,8 @@ function srtToAss(srtRaw) {
     const textIdx = lines.indexOf(timingLine) + 1;
     const text = lines.slice(textIdx).join(' ').trim();
     if (!text) continue;
-
     const allWords = text.split(/\s+/);
     const chunks = chunk(allWords, 4);
-
     const totalDur = endSec - startSec;
     const totalWords = allWords.length;
     let cursor = startSec;
@@ -249,17 +250,15 @@ function srtToAss(srtRaw) {
       events.push(`Dialogue: 0,${toAssTime(cs)},${toAssTime(ce)},Default,,0,0,0,,{\\pos(540,1200)}${karaoke}`);
     }
   }
-
   return assHeader() + events.join('\n') + '\n';
 }
-
 function chunk(arr, n) { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; }
 function toSec(h, m, s, ms) { return Number(h) * 3600 + Number(m) * 60 + Number(s) + Number(String(ms).padEnd(3, '0').slice(0, 3)) / 1000; }
 function toAssTime(sec) {
-  const total = Math.max(0, sec);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
+  const t = Math.max(0, sec);
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60);
+  const s = t % 60;
   const cs = Math.floor((s - Math.floor(s)) * 100);
   return `${h}:${String(m).padStart(2, '0')}:${String(Math.floor(s)).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
 }
@@ -286,8 +285,7 @@ function assHeader() {
   ].join('\n');
 }
 
-// ── start ───────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('Subtitler v1.1 listening on :' + PORT + ' (ffmpeg=' + ffmpegPath + ', whisperModel=' + WHISPER_MODEL + ')');
+  console.log('Subtitler v1.2 listening on :' + PORT + ' (ffmpeg=' + ffmpegPath + ', groq=' + (GROQ_API_KEY ? 'configured' : 'MISSING') + ')');
 });
