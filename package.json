@@ -1,7 +1,7 @@
 {
   "name": "qeep-subtitler",
-  "version": "1.1.0",
-  "description": "Burn karaoke subtitles into HeyGen videos via ffmpeg + auto Whisper transcription",
+  "version": "1.2.0",
+  "description": "Burn karaoke subtitles via ffmpeg, transcribe via Groq Whisper API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,8 +11,6 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "ffmpeg-static": "^5.2.0",
-    "@xenova/transformers": "^2.17.2",
-    "wavefile": "^11.0.0"
+    "ffmpeg-static": "^5.2.0"
   }
 }
