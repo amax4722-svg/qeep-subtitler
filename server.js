@@ -1,11 +1,12 @@
-// QEEP Subtitler Service v1.2
+// QEEP Subtitler Service v1.3
 // Cloud-Whisper edition: uses Groq Whisper API (free tier) for transcription.
 // Burns karaoke subs via ffmpeg, returns mp4 URL.
 //
-// POST /render { video_url, srt_url? OR srt_content? }
-// GET  /status/:jobId
-// GET  /files/:filename
-// GET  /health
+// POST   /render { video_url, srt_url? OR srt_content? }
+// GET    /status/:jobId
+// GET    /files/:filename
+// GET    /health
+// DELETE /admin/clean?older_than_minutes=10&secret=qeep2026
 
 const express = require('express');
 const { spawn } = require('child_process');
@@ -26,6 +27,7 @@ fs.mkdirSync(TMP, { recursive: true });
 const PUBLIC_BASE = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'whisper-large-v3-turbo';
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'qeep2026';
 
 // Persistent jobs file — survives cold restarts.
 const JOBS_FILE = path.join(TMP, 'jobs.json');
@@ -47,6 +49,39 @@ app.get('/health', (req, res) => {
     jobs: jobs.size,
     time: new Date().toISOString()
   });
+});
+
+// DELETE /admin/clean?older_than_minutes=10&secret=qeep2026
+// Чистит зависшие jobs из jobs.json + старые mp4 из tmp
+app.delete('/admin/clean', async (req, res) => {
+  const secret = req.query.secret;
+  if (secret !== ADMIN_SECRET) return res.status(403).json({ error: 'forbidden' });
+  const olderThanMin = Number(req.query.older_than_minutes || 10);
+  const cutoff = Date.now() - olderThanMin * 60 * 1000;
+  const doneCutoff = Date.now() - 60 * 60 * 1000;
+  let cleanedJobs = 0;
+  let cleanedFiles = 0;
+  for (const [id, job] of jobs.entries()) {
+    const ts = job.updatedAt || job.startedAt || 0;
+    const stuck = (job.status === 'processing' || job.status === 'pending') && ts < cutoff;
+    const oldDone = (job.status === 'done' || job.status === 'error') && ts < doneCutoff;
+    if (stuck || oldDone) {
+      jobs.delete(id);
+      cleanedJobs++;
+    }
+  }
+  await saveJobs();
+  try {
+    const files = await fsp.readdir(TMP);
+    for (const f of files) {
+      if (!f.endsWith('.mp4')) continue;
+      try {
+        const stat = await fsp.stat(path.join(TMP, f));
+        if (stat.mtimeMs < cutoff) { await fsp.unlink(path.join(TMP, f)); cleanedFiles++; }
+      } catch (e) {}
+    }
+  } catch (e) {}
+  res.json({ ok: true, cleaned_jobs: cleanedJobs, cleaned_files: cleanedFiles, remaining_jobs: jobs.size });
 });
 
 app.use('/files', express.static(TMP, { maxAge: '1h' }));
@@ -71,6 +106,7 @@ app.get('/status/:jobId', (req, res) => {
 
 async function renderJob(jobId, { video_url, srt_url, srt_content }) {
   const log = (m) => console.log('[' + jobId + ']', m);
+  setJob(jobId, { status: 'processing', startedAt: Date.now() });
   const videoPath = path.join(TMP, `${jobId}-in.mp4`);
   const audioPath = path.join(TMP, `${jobId}.mp3`);
   const assPath = path.join(TMP, `${jobId}.ass`);
@@ -140,10 +176,8 @@ async function groqTranscribeToSrt(audioPath) {
   if (!resp.ok) throw new Error('Groq API ' + resp.status + ': ' + text.slice(0, 500));
   const data = JSON.parse(text);
 
-  // verbose_json returns { segments: [{ start, end, text, ... }] }
   const segs = Array.isArray(data.segments) ? data.segments : [];
   if (segs.length === 0 && data.text) {
-    // fallback: synthesize one segment if no segmentation
     return `1\n00:00:00,000 --> 00:00:30,000\n${data.text.trim()}\n\n`;
   }
   let srt = '';
@@ -236,7 +270,7 @@ function srtToAss(srtRaw) {
     const text = lines.slice(textIdx).join(' ').trim();
     if (!text) continue;
     const allWords = text.split(/\s+/);
-    const chunks = chunk(allWords, 3); // 3 words per visible line to keep text inside frame
+    const chunks = chunk(allWords, 3);
     const totalDur = endSec - startSec;
     const totalWords = allWords.length;
     let cursor = startSec;
@@ -247,7 +281,6 @@ function srtToAss(srtRaw) {
       cursor = ce;
       const perWordCs = Math.max(5, Math.round((dur / c.length) * 100));
       const karaoke = c.map(w => `{\\kf${perWordCs}}${escapeAssText(w)}`).join(' ');
-      // No \pos — let Alignment + MarginV/L/R handle position. Style anchors to bottom-center at MarginV from bottom.
       events.push(`Dialogue: 0,${toAssTime(cs)},${toAssTime(ce)},Default,,0,0,0,,${karaoke}`);
     }
   }
@@ -267,10 +300,6 @@ function escapeAssText(t) {
   return String(t).replace(/\\/g, '\\\\').replace(/\n/g, '\\N').replace(/\{/g, '\\{').replace(/\}/g, '\\}');
 }
 function assHeader() {
-  // Style anchors text to BOTTOM-CENTER (Alignment=2). Text grows upward from MarginV.
-  // PlayResY=1920, MarginV=720 → baseline ~y=1200. Left/Right margins 90 keep text inside frame.
-  // WrapStyle=0 = smart wrap (top line wider) so long phrases wrap to 2 lines instead of overflowing.
-  // Font 84pt (was 100) gives more breathing room horizontally.
   return [
     '[Script Info]',
     'Title: QEEP karaoke subs',
@@ -285,12 +314,12 @@ function assHeader() {
     'Style: Default,Inter,84,&H0000FFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,10,6,2,90,90,720,1',
     '',
     '[Events]',
-    'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+    'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Encoding, Text',
     ''
   ].join('\n');
 }
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('Subtitler v1.2 listening on :' + PORT + ' (ffmpeg=' + ffmpegPath + ', groq=' + (GROQ_API_KEY ? 'configured' : 'MISSING') + ')');
+  console.log('Subtitler v1.3 listening on :' + PORT + ' (ffmpeg=' + ffmpegPath + ', groq=' + (GROQ_API_KEY ? 'configured' : 'MISSING') + ')');
 });
