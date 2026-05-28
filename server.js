@@ -1,6 +1,7 @@
-// QEEP Subtitler Service v1.3
+// QEEP Subtitler Service v1.4
 // Cloud-Whisper edition: uses Groq Whisper API (free tier) for transcription.
 // Burns karaoke subs via ffmpeg, returns mp4 URL.
+// v1.4: downscale to 720x1280 during burn-in to fit Render Free 512MB RAM.
 //
 // POST   /render { video_url, srt_url? OR srt_content? }
 // GET    /status/:jobId
@@ -134,11 +135,16 @@ async function renderJob(jobId, { video_url, srt_url, srt_content }) {
   const ass = srtToAss(srt);
   await fsp.writeFile(assPath, ass, 'utf8');
 
-  log('burning subtitles with ffmpeg');
+  log('burning subtitles with ffmpeg (downscale 720x1280, ultrafast, threads=1)');
   await runFfmpeg([
     '-y', '-i', videoPath,
-    '-vf', `ass=${escapeForFilter(assPath)}`,
-    '-c:a', 'copy', '-preset', 'veryfast', '-crf', '23',
+    '-vf', `scale=720:1280,ass=${escapeForFilter(assPath)}`,
+    '-c:v', 'libx264',
+    '-c:a', 'copy',
+    '-preset', 'ultrafast',
+    '-crf', '23',
+    '-threads', '1',
+    '-pix_fmt', 'yuv420p',
     outPath
   ]);
 
@@ -300,18 +306,21 @@ function escapeAssText(t) {
   return String(t).replace(/\\/g, '\\\\').replace(/\n/g, '\\N').replace(/\{/g, '\\{').replace(/\}/g, '\\}');
 }
 function assHeader() {
+  // Output 720x1280 (downscaled from 1080x1920 to fit Render Free RAM).
+  // Fontsize 56, MarginV 480 (= y~800 на 1280 — чуть ниже центра).
+  // Outline 7, Shadow 4, MarginL/R 60.
   return [
     '[Script Info]',
     'Title: QEEP karaoke subs',
     'ScriptType: v4.00+',
-    'PlayResX: 1080',
-    'PlayResY: 1920',
+    'PlayResX: 720',
+    'PlayResY: 1280',
     'ScaledBorderAndShadow: yes',
     'WrapStyle: 0',
     '',
     '[V4+ Styles]',
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-    'Style: Default,Inter,84,&H0000FFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,10,6,2,90,90,720,1',
+    'Style: Default,Inter,56,&H0000FFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,7,4,2,60,60,480,1',
     '',
     '[Events]',
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Encoding, Text',
@@ -321,5 +330,5 @@ function assHeader() {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('Subtitler v1.3 listening on :' + PORT + ' (ffmpeg=' + ffmpegPath + ', groq=' + (GROQ_API_KEY ? 'configured' : 'MISSING') + ')');
+  console.log('Subtitler v1.4 listening on :' + PORT + ' (ffmpeg=' + ffmpegPath + ', groq=' + (GROQ_API_KEY ? 'configured' : 'MISSING') + ')');
 });
