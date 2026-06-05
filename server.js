@@ -139,14 +139,15 @@ async function renderJob(jobId, { video_url, srt_url, srt_content, pexels_querie
   log('done -> ' + outName);
 }
 
-// ── Pexels b-roll overlay (V1.3) ────────────────
-// Downloads N Pexels videos for given queries, overlays them on top of HeyGen video
-// at evenly spaced timecodes. HeyGen audio remains intact.
+// ── Pexels b-roll overlay (V1.5 — light edition for Render Free) ─────
+// Memory-conscious: only 3 clips, 720x1280 internal, ultrafast preset.
+// Falls back gracefully if anything heavy fails — never blocks the pipeline.
 async function buildPexelsOverlay(jobId, baseVideoPath, queries, outPath, log) {
   const baseDuration = await probeDuration(baseVideoPath);
   log('base video duration: ' + baseDuration.toFixed(1) + 's');
-  const queriesUsed = queries.slice(0, 6);
-  const clipDur = Math.max(2, Math.floor(baseDuration / queriesUsed.length));
+  // V1.5: 3 clips max for Render Free 512MB RAM constraint
+  const queriesUsed = queries.slice(0, 3);
+  const clipDur = Math.max(3, Math.floor(baseDuration / queriesUsed.length));
   const downloaded = [];
   for (let i = 0; i < queriesUsed.length; i++) {
     const q = queriesUsed[i];
@@ -162,29 +163,30 @@ async function buildPexelsOverlay(jobId, baseVideoPath, queries, outPath, log) {
   }
   if (downloaded.length === 0) throw new Error('no pexels clips downloaded');
 
-  // Build ffmpeg filter: scale + crop each overlay clip to 1080x1920, then overlay onto base at timecode.
+  // Build ffmpeg filter at 720x1280 (lighter on memory than 1080x1920).
+  // Final output will still be 1080x1920 because we scale up at burn-subtitles step.
   const inputs = ['-i', baseVideoPath];
   for (const d of downloaded) inputs.push('-i', d.path);
   const filters = [];
-  // Base scaled to 1080x1920
-  filters.push('[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[base]');
+  filters.push('[0:v]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280[base]');
   let prev = 'base';
   downloaded.forEach((d, idx) => {
     const i = idx + 1;
-    filters.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setpts=PTS-STARTPTS,trim=duration=${d.dur}[ov${idx}]`);
+    filters.push(`[${i}:v]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setpts=PTS-STARTPTS,trim=duration=${d.dur}[ov${idx}]`);
     filters.push(`[${prev}][ov${idx}]overlay=enable='between(t,${d.start},${d.start + d.dur})':x=0:y=0[m${idx}]`);
     prev = `m${idx}`;
   });
   filters.push(`[${prev}]copy[outv]`);
   const filterStr = filters.join(';');
 
-  log('compositing ' + downloaded.length + ' overlays via ffmpeg');
+  log('compositing ' + downloaded.length + ' overlays via ffmpeg (720x1280, ultrafast)');
   await runFfmpeg([
     '-y', ...inputs,
     '-filter_complex', filterStr,
     '-map', '[outv]', '-map', '0:a?',
-    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-    '-c:a', 'aac', '-b:a', '128k',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+    '-c:a', 'aac', '-b:a', '96k',
+    '-threads', '2',
     '-shortest',
     outPath
   ]);
